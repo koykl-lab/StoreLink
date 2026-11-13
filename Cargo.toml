@@ -1,0 +1,33 @@
+[package]
+name = "storelink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+description = "Versioned-object lifetime coordination with regional DynamoDB transactions"
+
+[features]
+default = ["aws"]
+aws = ["dynamodb", "s3"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:tokio"]
+s3 = ["dep:aws-sdk-s3", "dep:bytes", "dep:futures-util", "dep:tokio"]
+# Explicit native-cloud test tooling; not enabled by the runtime/default feature.
+aws-acceptance = ["dynamodb", "dep:aws-config", "dep:aws-sdk-sts"]
+
+[dependencies]
+aws-config = { version = "=1.13.0", optional = true }
+aws-sdk-sts = { version = "=1.124.0", optional = true }
+aws-sdk-dynamodb = { version = "=1.137.0", optional = true }
+aws-sdk-s3 = { version = "=1.157.0", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+proptest = "1"

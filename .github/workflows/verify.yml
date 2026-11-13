@@ -1,0 +1,136 @@
+name: StoreLink verification and release
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  release:
+    types: [published]
+permissions:
+  contents: read
+concurrency:
+  group: storelink-verify-${{ github.ref }}
+  queue: ${{ github.ref == 'refs/heads/main' && 'max' || 'single' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_BUILD_JOBS: '1'
+  AWS_EC2_METADATA_DISABLED: 'true'
+  AWS_CONFIG_FILE: /dev/null
+  AWS_SHARED_CREDENTIALS_FILE: /dev/null
+jobs:
+  rust:
+    name: Rust contracts (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # For release.published this is the commit of the released tag,
+          # not the main-push SHA that happened to invoke Release Please.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned Rust toolchain and feature matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUSTUP_TOOLCHAIN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+          command -v rustup
+          rustup show active-toolchain
+          cargo fmt --check
+          for feature in minimal dynamodb s3 all; do
+            case "$feature" in
+              minimal) flags=(--no-default-features) ;;
+              all) flags=(--all-features) ;;
+              *) flags=(--no-default-features --features "$feature") ;;
+            esac
+            cargo clippy --locked --all-targets "${flags[@]}" -- -D warnings
+            cargo test --locked --all-targets "${flags[@]}"
+          done
+          cargo test --locked --all-features --doc
+          # No --ignored: live AWS acceptance is a separate explicit operation.
+      - name: Verify the native Cargo source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RUSTUP_TOOLCHAIN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+          # publish=false forbids registry publication, not cargo package.
+          cargo package --locked --package storelink --all-features
+          git diff --exit-code -- Cargo.toml Cargo.lock
+          cd target/package
+          sha256sum storelink-*.crate > SHA256SUMS
+      - name: Retain the verified release package
+        if: github.event_name == 'release' && matrix.runner == 'ubuntu-24.04'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: storelink-source
+          path: |
+            target/package/storelink-*.crate
+            target/package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+  verification:
+    name: StoreLink verification
+    if: ${{ always() }}
+    needs: [rust]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both native architectures and package verification
+        env:
+          RESULT: ${{ needs.rust.result }}
+        run: test "$RESULT" = success
+  release-please:
+    name: StoreLink Release Please
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.RELEASE_PLEASE_ENABLED == 'true'
+    needs: [verification]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Create repository-scoped release App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Maintain the native release PR and publish merged releases
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app.outputs.token }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+  release-assets:
+    name: Attach StoreLink release artifacts
+    if: github.event_name == 'release'
+    needs: [verification]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: storelink-source
+          path: release-assets
+      - name: Attach the package built from this released tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          cd release-assets
+          sha256sum --check SHA256SUMS
+          package="storelink-${RELEASE_TAG#v}.crate"
+          test -f "$package"
+          # Never overwrite an existing release asset implicitly.
+          gh release upload "$RELEASE_TAG" "$package" SHA256SUMS
