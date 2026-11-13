@@ -287,7 +287,7 @@ fn text<'a>(item: &'a Item, name: &str) -> Result<&'a str, ReferenceError> {
         _ => Err(ReferenceError::CorruptRecord),
     }
 }
-fn decode_reference(
+pub(super) fn decode_reference(
     domain: &DomainId,
     id: &ReferenceId,
     item: &Item,

@@ -168,6 +168,8 @@ fn scenario_future_layout_is_bounded() {
 
 #[path = "journal_contract/abandoned.rs"]
 mod abandoned;
+#[path = "journal_contract/discovery.rs"]
+mod discovery;
 #[path = "journal_contract/maintenance.rs"]
 mod maintenance;
 #[path = "journal_contract/staging.rs"]
@@ -238,6 +240,7 @@ pub async fn exercise(f: Fixture) {
     Box::pin(exercise_upload_admission(&f)).await;
     Box::pin(staging::exercise(&f)).await;
     Box::pin(maintenance::exercise(&f)).await;
+    Box::pin(discovery::exercise(&f)).await;
 }
 
 async fn exercise_journal(f: &Fixture) {

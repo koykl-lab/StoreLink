@@ -592,6 +592,15 @@ async fn historical_attribution_and_native_terminal_markers_are_preserved() {
         "<NextKeyMarker>managed%2Fb</NextKeyMarker><NextVersionIdMarker>not-returned</NextVersionIdMarker>")));
     let p = list_version_page(&q, None, 2).await.unwrap();
     assert_eq!(p.next_cursor().unwrap().key_marker(), "managed/b");
+    let debug = format!("{p:?}");
+    for private_value in [
+        q.configuration().bucket(),
+        q.configuration().expected_owner(),
+        "managed/b",
+        "not-returned",
+    ] {
+        assert!(!debug.contains(private_value));
+    }
     f.done(true);
 }
 

@@ -39,6 +39,9 @@ pub struct StagedSnapshot {
     attempt: ResourceId,
     namespace: NamespaceId,
     configuration_revision: Uuid,
+    constraints: UploadConstraints,
+    verified_length: u64,
+    verified_full_sha256: Option<[u8; 32]>,
     claim: Claim,
 }
 impl StagedSnapshot {
@@ -61,6 +64,16 @@ impl StagedSnapshot {
     }
     pub fn version(&self) -> &VersionRef {
         self.claim.version()
+    }
+    /// Actual byte length verified by the upload adapter, not an expected length.
+    /// This immutable observation grants no read or publication authority.
+    pub fn verified_length(&self) -> u64 {
+        self.verified_length
+    }
+    /// Full-object SHA-256 actually verified by the adapter, if any. A caller's
+    /// expected hash is never substituted for absent verification evidence.
+    pub fn verified_full_sha256(&self) -> Option<&[u8; 32]> {
+        self.verified_full_sha256.as_ref()
     }
 }
 
@@ -198,6 +211,9 @@ fn selection_actions(
         attempt: attempt.id().clone(),
         namespace: namespace.id().clone(),
         configuration_revision: namespace.configuration_revision(),
+        constraints: attempt.constraints().clone(),
+        verified_length: length,
+        verified_full_sha256: full_sha256.copied(),
         claim: Claim::new(
             ResourceId::from_command(command),
             version.clone(),
@@ -233,6 +249,15 @@ fn staged_binding(staged: &StagedSnapshot) -> Result<(), UploadError> {
         || scope.generation() > attempt.generation()
         || attempt.generation() > selection.generation()
         || staged.configuration_revision.is_nil()
+        || staged.verified_length > staged.constraints.max_length()
+        || staged
+            .constraints
+            .expected_length()
+            .is_some_and(|n| n != staged.verified_length)
+        || staged
+            .constraints
+            .full_sha256()
+            .is_some_and(|hash| Some(hash) != staged.verified_full_sha256())
     {
         return Err(UploadError::Binding);
     }
@@ -249,7 +274,7 @@ pub(in crate::dynamodb) fn encode_staged(staged: &StagedSnapshot) -> Result<Item
     staged_binding(staged)?;
     let mut item = resource_key("STAGED", &staged.intent);
     for (name, value) in [
-        ("record", "staged".to_owned()),
+        ("record", "staged-verified-v1".to_owned()),
         ("kind", "STAGED".to_owned()),
         ("domain", staged.intent.scope().domain().as_str().to_owned()),
         (
@@ -282,8 +307,21 @@ pub(in crate::dynamodb) fn encode_staged(staged: &StagedSnapshot) -> Result<Item
         ("attempt_generation", staged.attempt.scope().generation()),
         ("claim_generation", staged.claim.id().scope().generation()),
         ("deadline", staged.claim.deadline().as_millis()),
+        ("max_length", staged.constraints.max_length()),
+        ("verified_length", staged.verified_length),
     ] {
         item.insert(name.into(), n(value));
+    }
+    if let Some(length) = staged.constraints.expected_length() {
+        item.insert("expected_length".into(), n(length));
+    }
+    for (field, hash) in [
+        ("full_sha256", staged.constraints.full_sha256()),
+        ("verified_full_sha256", staged.verified_full_sha256()),
+    ] {
+        if let Some(hash) = hash {
+            item.insert(field.into(), AttributeValue::B(Blob::new(hash)));
+        }
     }
     insert_version(&mut item, staged.version());
     check_size(&item)?;
@@ -335,6 +373,28 @@ pub(in crate::dynamodb) fn decode_staged(
     item: &Item,
 ) -> Result<StagedSnapshot, UploadError> {
     check_size(item)?;
+    // Pre-release format boundary: old/unknown rows contain no trustworthy facts.
+    if text(item, "record")? != "staged-verified-v1" {
+        return Err(UploadError::Corrupt);
+    }
+    let hash = |field| -> Result<Option<[u8; 32]>, UploadError> {
+        match item.get(field) {
+            None => Ok(None),
+            Some(AttributeValue::B(value)) => value
+                .as_ref()
+                .try_into()
+                .map(Some)
+                .map_err(|_| UploadError::Corrupt),
+            _ => Err(UploadError::Corrupt),
+        }
+    };
+    let constraints = UploadConstraints::new(
+        number(item, "max_length")?,
+        item.contains_key("expected_length")
+            .then(|| number(item, "expected_length"))
+            .transpose()?,
+        hash("full_sha256")?,
+    )?;
     let domain = DomainId::new(text(item, "domain")?)?;
     let incarnation = uuid(item, "incarnation")?;
     let id = |generation: &str, unique: &str| -> Result<ResourceId, UploadError> {
@@ -374,6 +434,9 @@ pub(in crate::dynamodb) fn decode_staged(
         attempt: id("attempt_generation", "attempt_uuid")?,
         namespace: NamespaceId::new(text(item, "namespace_id")?)?,
         configuration_revision: uuid(item, "configuration_revision")?,
+        constraints,
+        verified_length: number(item, "verified_length")?,
+        verified_full_sha256: hash("verified_full_sha256")?,
         claim,
     };
     exact(item, encode_staged(&staged)?)?;
@@ -619,6 +682,8 @@ mod tests {
             f.ns.configuration_revision()
         );
         assert_eq!(staged.version(), &f.version);
+        assert_eq!(staged.verified_length(), f.length);
+        assert_eq!(staged.verified_full_sha256(), f.hash.as_ref());
         assert_eq!(staged.claim().id(), &ResourceId::from_command(&f.command));
         assert_eq!(staged.claim().revision(), f.command.uuid());
         assert_eq!(staged.claim().state(), ClaimState::Active);
@@ -637,6 +702,14 @@ mod tests {
         f.attempt.admission.constraints = f.intent.constraints().clone();
         f.hash = None;
         let first = f.actions();
+        let staged = decode_staged(f.intent.id(), first[4].put.as_ref().unwrap().item()).unwrap();
+        assert_eq!(staged.verified_length(), 10); // unknown expected length is NOT zero
+        assert_eq!(staged.verified_full_sha256(), None);
+        assert!(
+            condition(&encode_staged(&staged).unwrap())
+                .expression
+                .contains("attribute_not_exists(#missing_verified_full_sha256)")
+        );
         assert_eq!(first, f.build(ts(2500), clock(1100)).unwrap());
         for action in &first[1..3] {
             let expression = action.put.as_ref().unwrap().condition_expression().unwrap();
@@ -665,6 +738,23 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(first[4], renewed[4]); // intent renewal does NOT keep staging alive
+    }
+
+    #[test]
+    fn verified_hash_is_independent_of_optional_expected_hash() {
+        let mut f = Fixture::new();
+        f.intent.admission.constraints = UploadConstraints::new(100, None, None).unwrap();
+        f.attempt.admission.constraints = f.intent.constraints().clone();
+        for hash in [None, Some([7; 32])] {
+            f.hash = hash;
+            let staged = f.staged();
+            assert_eq!(staged.verified_length(), 10);
+            assert_eq!(staged.verified_full_sha256(), hash.as_ref());
+            let row = encode_staged(&staged).unwrap();
+            assert!(!row.contains_key("full_sha256"));
+            assert_eq!(row.contains_key("verified_full_sha256"), hash.is_some());
+            assert_eq!(decode_staged(f.intent.id(), &row).unwrap(), staged);
+        }
     }
 
     #[test]
@@ -906,10 +996,12 @@ mod tests {
         for field in original.keys() {
             let mut item = original.clone();
             item.remove(field);
-            assert!(
-                decode_staged(f.intent.id(), &item).is_err(),
-                "missing {field}"
-            );
+            if !["expected_length", "full_sha256"].contains(&field.as_str()) {
+                assert!(
+                    decode_staged(f.intent.id(), &item).is_err(),
+                    "missing {field}"
+                );
+            }
             let mut item = original.clone();
             item.insert(field.clone(), AttributeValue::Bool(true));
             assert!(
@@ -921,6 +1013,29 @@ mod tests {
             ("pk", s("alias")),
             ("sk", s("alias")),
             ("record", s("intent")),
+            ("record", s("staged")),
+            ("record", s("staged-verified-v2")),
+            ("verified_length", n(11)),
+            ("verified_length", n(101)),
+            ("verified_length", n(i64::MAX as u64 + 1)),
+            ("verified_length", AttributeValue::N("-1".into())),
+            ("verified_length", AttributeValue::N("1.5".into())),
+            ("verified_length", AttributeValue::N("010".into())),
+            (
+                "verified_full_sha256",
+                AttributeValue::B(Blob::new([7; 31])),
+            ),
+            (
+                "verified_full_sha256",
+                AttributeValue::B(Blob::new([7; 33])),
+            ),
+            (
+                "verified_full_sha256",
+                AttributeValue::B(Blob::new([8; 32])),
+            ),
+            ("full_sha256", AttributeValue::B(Blob::new([8; 32]))),
+            ("expected_length", n(11)),
+            ("max_length", n(9)),
             ("kind", s("INTENT")),
             ("domain", s("other")),
             ("incarnation", s(Uuid::new_v4().to_string())),

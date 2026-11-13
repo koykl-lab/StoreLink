@@ -131,6 +131,7 @@ fn publication_actions(
             || stage.configuration_revision() != intent.configuration_revision()
             || stage.version().store() != intent.target().store()
             || stage.version().key() != intent.target().key()
+            || stage.constraints != *intent.constraints()
             || revision.is_nil()
             || revision == intent.revision()
         {
@@ -222,6 +223,9 @@ mod tests {
                 attempt: resource(&scope, 2),
                 namespace: intent.namespace_id().clone(),
                 configuration_revision: intent.configuration_revision(),
+                constraints: intent.constraints().clone(),
+                verified_length: 10,
+                verified_full_sha256: None,
                 claim: Claim::new(
                     resource(&scope, 3),
                     VersionRef::new(store, "managed/key", "selected-version").unwrap(),
@@ -277,6 +281,28 @@ mod tests {
     }
     fn version_updates(actions: &[TransactWriteItem]) -> Vec<&aws_sdk_dynamodb::types::Update> {
         actions.iter().filter_map(|a| a.update.as_ref()).collect()
+    }
+
+    #[test]
+    fn publication_preserves_and_guards_unknown_length_verification_facts() {
+        for hash in [None, Some([7; 32])] {
+            let mut f = Fixture::new();
+            f.stage.verified_full_sha256 = hash;
+            let actions = f.build(&[f.attach("slot")], &[]).unwrap();
+            let put = actions.last().unwrap().put.as_ref().unwrap();
+            assert_full_old(put, &encode_staged(&f.stage).unwrap());
+            let next = decode_staged(f.intent.id(), put.item()).unwrap();
+            assert_eq!(next.verified_length(), 10);
+            assert_eq!(next.verified_full_sha256(), hash.as_ref());
+            assert_eq!(next.constraints.expected_length(), None);
+            assert_eq!(next.claim().state(), ClaimState::Released);
+            assert!(
+                put.expression_attribute_names()
+                    .unwrap()
+                    .values()
+                    .any(|name| name == "verified_full_sha256")
+            );
+        }
     }
 
     #[test]
@@ -724,7 +750,13 @@ mod tests {
 
     #[tokio::test]
     async fn full_journal_budget_includes_application_admission_and_receipt() {
-        let f = Fixture::new();
+        let mut f = Fixture::new();
+        f.stage.constraints =
+            UploadConstraints::new(i64::MAX as u64, Some(i64::MAX as u64), Some([255; 32]))
+                .unwrap();
+        f.stage.verified_length = i64::MAX as u64;
+        f.stage.verified_full_sha256 = Some([255; 32]);
+        f.intent.admission.constraints = f.stage.constraints.clone();
         let (journal, contexts, source) = wire_fixture(&f, 3, f.stage.version()).await;
         let mut contexts = contexts.into_iter();
         let prepare = |context, count| {

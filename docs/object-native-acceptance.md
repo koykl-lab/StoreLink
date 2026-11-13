@@ -152,6 +152,43 @@ loopback coverage; no deliberately abandoned real MPU is added. These cases do
 not implement a recurring scanner, fabricate GC progress, or prove full GC
 convergence, late in-flight request settlement or metadata compaction.
 
+Only after that final empty page, a bounded **inventory scheduling-progress** case
+uses two more predeclared keys, `a/inventory-first` and `a/inventory-second`:
+
+- Two explicit fixture-only raw PutObject requests write distinct synthetic
+  payloads under 64 bytes, with expected-owner checks and non-null returned
+  VersionIds. They create no MPU and are not library adoption/publication.
+- `load_inventory_progress(&qualified)` must initially expose no cursor, zero
+  completed passes and no completion metric. A native `list_version_page` with
+  limit **1** must return one of those exact VersionRefs and a continuation.
+  The test inspects every returned item, rejects delete markers/unexpected data,
+  and records the actual candidate as **retained test data**, not GC work.
+- Before checkpointing, capture another initial progress observation and another
+  native first page; inspect that page too. Checkpoint the first considered page,
+  then require the stale checkpoint to return specifically
+  `InventoryProgressError::Conflict`. Other errors and unexpected success fail;
+  a fresh native load must preserve the first page's markers, zero completed
+  passes and absent completion metric.
+- Supply the **restored opaque cursor from that load** to the next native S3 page,
+  not the original in-memory cursor or reconstructed markers. Check that the two
+  recorded candidates are distinct and exactly the two expected VersionRefs,
+  independent of alphabetical ordering. Native next markers are never assumed
+  to identify the first returned entry.
+- The terminal page checkpoint clears continuation and increments completed
+  passes. A final native reload must show cursor None, completed passes **1**, and
+  the supplied bounded diagnostic TimestampMs(1000). This synthetic metric is
+  scheduling evidence, never a trusted GC/retention clock or elapsed-time claim.
+
+This is durable cursor reload/restart acceptance, not process-crash injection or
+recurring scanner/GC convergence acceptance. The extension adds exactly two Puts,
+three limit-1 S3 listings (including the stale page), four progress loads and three
+checkpoint attempts (including the required conflict) on its success path: **12
+scenario requests**, with no retries or new resources. Existing parent cleanup
+adds two exact-version deletions and retains its whole-prefix version/marker/MPU
+checks even after failure. The 600-second scenario and 180-second cleanup budgets
+are unchanged; exhaustion still fails rather than claiming progress. Neither of
+these retained synthetic versions is garbage-collected by the library.
+
 Payloads are synthetic: zero bytes, 37 bytes and **8 MiB + 17 bytes**. The current
 transfer adapter uses a single Put for the first two and two 8-MiB-bounded parts for
 the third. No giant payloads, intentional abandoned MPU or real-cloud fault
@@ -181,9 +218,10 @@ listings (at most 1000 configurations) and the enclosing scenario deadline.
 ## Cleanup, unknown outcomes and evidence
 
 Before **any writes**, create-new, fsync'd private `object-<RUN_UUID>.json` evidence
-records the exact fixture, UUID prefix and all five planned keys (`a/empty`,
-`a/small`, `a/multipart`, `a/orphan-unselected`, `a/orphan-unattributed`), including
-both synthetic orphan keys **before their S3 writes**. A reused evidence name
+records the exact fixture, UUID prefix and all seven planned keys (`a/empty`,
+`a/small`, `a/multipart`, `a/orphan-unselected`, `a/orphan-unattributed`,
+`a/inventory-first`, `a/inventory-second`), including both orphan keys and both
+synthetic inventory keys **before their S3 writes**. A reused evidence name
 fails before mutation. It intentionally records no credentials, profile, payload,
 attribution metadata or response body. This prefix allowlist supports unknown
 Put/Create/Complete outcomes where no candidate version was returned. Evidence is
@@ -229,12 +267,13 @@ An incomplete/failed listing, delete or cleanup timeout also fails the test.
 Compile only (no cloud calls or ignored execution):
 
 ```sh
-CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
-  cargo test --all-features --test object_aws --no-run
+CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-verification-target \
+  cargo test --locked --offline --all-features --test object_aws --no-run
 ```
 
 Ordinary tests in this target check identity/ARN/run tags, namespace/prefix
-ownership, the distinct predeclared synthetic keys, ACTIVE pk/sk schemas and
+ownership, all seven distinct predeclared keys including both retained inventory
+keys, ACTIVE pk/sk schemas and
 incomplete-pagination classification. Two
 additional regressions construct synthetic-credential, explicit-loopback SDK
 clients: the pinned SDK deserializes terminal MPU XML with empty and populated
@@ -243,15 +282,15 @@ inventories. They do not load real credentials/configuration or contact AWS.
 Compilation does not run these ordinary tests. To run only offline tests:
 
 ```sh
-CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
-  cargo test --all-features --test object_aws -- --skip native_object_contract_aws
+CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-verification-target \
+  cargo test --locked --offline --all-features --test object_aws -- --skip native_object_contract_aws
 ```
 
 Strict Clippy for this target (also no ignored execution or AWS calls):
 
 ```sh
-CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
-  cargo clippy --all-features --test object_aws -- -D warnings
+CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-verification-target \
+  cargo clippy --locked --offline --all-features --test object_aws -- -D warnings
 ```
 
 Only after separate review, provisioning and explicit authorization, an operator

@@ -27,6 +27,9 @@ type Item = HashMap<String, AttributeValue>;
 #[cfg(test)]
 #[path = "journal_control_tests.rs"]
 mod control_tests;
+#[cfg(test)]
+#[path = "journal_observation_tests.rs"]
+mod observation_tests;
 
 /// One serializable observation of an application item and this domain's fence.
 /// Neither the item nor its absence establishes an operation outcome, permission,
@@ -40,6 +43,23 @@ pub struct ApplicationItemObservation {
 impl ApplicationItemObservation {
     pub fn item(&self) -> Option<&Item> {
         self.item.as_ref()
+    }
+    pub fn fence(&self) -> &DomainFence {
+        &self.fence
+    }
+}
+
+/// Ordered application items and the fence from ONE native transactional read.
+/// Observations are not permissions, history, attachment authority or pruning
+/// evidence. Cloning does not refresh them. No public construction/deserialization.
+#[derive(Clone)]
+pub struct ApplicationItemsObservation {
+    items: Vec<Option<Item>>,
+    fence: DomainFence,
+}
+impl ApplicationItemsObservation {
+    pub fn items(&self) -> &[Option<Item>] {
+        &self.items
     }
     pub fn fence(&self) -> &DomainFence {
         &self.fence
@@ -234,33 +254,60 @@ impl CommandJournal {
         &self,
         get: Get,
     ) -> Result<ApplicationItemObservation, JournalError> {
-        let get = self.tables.qualify_application_read(get)?;
+        let mut observed = self.observe_application_items(vec![get]).await?;
+        Ok(ApplicationItemObservation {
+            item: observed.items.remove(0),
+            fence: observed.fence,
+        })
+    }
+
+    /// Observe 1..=99 enrolled application Gets plus the domain fence in one
+    /// native TransactGetItems. Input order and native projection/key semantics
+    /// are preserved. All targets are qualified before any I/O; service limits
+    /// and diagnostics remain native, never a truncated or partially read result.
+    pub async fn observe_application_items(
+        &self,
+        gets: Vec<Get>,
+    ) -> Result<ApplicationItemsObservation, JournalError> {
+        if gets.is_empty() || gets.len() > 99 {
+            return Err(JournalError::Corrupt(
+                "application observation requires 1..=99 Gets".into(),
+            ));
+        }
+        let gets = gets
+            .into_iter()
+            .map(|get| self.tables.qualify_application_read(get))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = gets.len() + 1;
         let control = Get::builder()
             .table_name(self.coordination_arn())
             .set_key(Some(control_key(&self.domain)))
             .build()
             .map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        let mut requests = Vec::with_capacity(expected);
+        requests.push(TransactGetItem::builder().get(control).build());
+        requests.extend(
+            gets.into_iter()
+                .map(|get| TransactGetItem::builder().get(get).build()),
+        );
         let output = self
             .client
             .transact_get_items()
-            .set_transact_items(Some(vec![
-                TransactGetItem::builder().get(control).build(),
-                TransactGetItem::builder().get(get).build(),
-            ]))
+            .set_transact_items(Some(requests))
             .send()
             .await
             .map_err(|e| {
                 JournalError::Native(native_message(e.as_service_error(), e.to_string()))
             })?;
         let rows = output.responses();
-        if rows.len() != 2 {
+        if rows.len() != expected {
             return Err(JournalError::Corrupt(
                 "incomplete application/fence observation".into(),
             ));
         }
         let fence = parse_control(rows[0].item.as_ref(), &self.domain)?;
-        Ok(ApplicationItemObservation {
-            item: rows[1].item.clone(),
+        Ok(ApplicationItemsObservation {
+            items: rows[1..].iter().map(|row| row.item.clone()).collect(),
             fence,
         })
     }
