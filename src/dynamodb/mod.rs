@@ -4,8 +4,11 @@
 //! Application expressions remain native; they are not parsed or evaluated here.
 
 mod actions;
+mod application_pruning;
 mod journal;
 mod maintenance;
+#[cfg(feature = "s3")]
+mod orphans;
 mod protection;
 mod pruning;
 mod reclamation;
@@ -14,6 +17,7 @@ mod tables;
 mod uploads;
 
 pub use actions::{ActionError, ApplicationActions, ApplicationInspection};
+pub use application_pruning::{ApplicationPruningError, ApplicationPruningObservation};
 pub use journal::{
     ActionOrigin, ApplicationItemObservation, AttemptFailure, CancellationReason, CommandContext,
     CommandJournal, CommandToken, ExecutionReport, JournalError, Outcome, PreparedCommand,
@@ -22,6 +26,8 @@ pub use maintenance::{
     MaintenanceError, MaintenanceObservation, MaintenanceOutcome, MaintenancePolicy,
     MaintenanceReport,
 };
+#[cfg(feature = "s3")]
+pub use orphans::{OrphanError, OrphanGracePolicy, OrphanPreparation};
 pub use protection::{
     ProtectionError, UseAuthorization, UsePinSnapshot, UseSource, VersionSnapshot, VersionState,
 };
