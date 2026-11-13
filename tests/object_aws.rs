@@ -25,15 +25,17 @@ use storelink::{
     claim::{ClaimPolicy, ClaimState},
     clock::{ClockError, ClockObservation, TimestampMs},
     dynamodb::{
-        ApplicationActions, CommandJournal, EnrolledTables, IntentState, NamespaceSnapshot,
-        Outcome, PreparedCommand, ReclamationError, ReferenceChange, ReferenceId,
-        UploadConstraints, VersionState,
+        ApplicationActions, AttemptState, CommandJournal, EnrolledTables, IntentState,
+        NamespaceSnapshot, OrphanError, OrphanGracePolicy, OrphanPreparation, Outcome,
+        PreparedCommand, ReclamationError, ReferenceChange, ReferenceId, UploadConstraints,
+        VersionState,
     },
     identity::{DomainId, NamespaceId, ResourceId, StoreId, VersionRef},
     s3::{
         DeletionError, DeletionOutcome, NamespaceConfiguration, NamespaceConfigurationSpec,
-        QualifiedNamespace, delete_retiring_version, qualify_existing, qualify_fresh,
-        transfer_upload, verify_candidate,
+        ObservedOrphanObject, OrphanAttribution, QualifiedNamespace, delete_retiring_version,
+        list_version_page, observe_orphan_object, qualify_existing, qualify_fresh, transfer_upload,
+        verify_candidate,
     },
 };
 use tokio::io::AsyncReadExt;
@@ -51,6 +53,15 @@ const MAX_PAGES: usize = 10;
 const PREFLIGHT: Duration = Duration::from_secs(180);
 const SCENARIO: Duration = Duration::from_secs(600);
 const CLEANUP: Duration = Duration::from_secs(180);
+const KNOWN_ORPHAN: &str = "orphan-unselected";
+const UNATTRIBUTED_ORPHAN: &str = "orphan-unattributed";
+const PLANNED_LABELS: [&str; 5] = [
+    "empty",
+    "small",
+    "multipart",
+    KNOWN_ORPHAN,
+    UNATTRIBUTED_ORPHAN,
+];
 
 // Errors intentionally discard SDK bodies, native metadata, credentials and paths.
 fn checked<T, E>(value: Result<T, E>, label: &'static str) -> Check<T> {
@@ -299,7 +310,7 @@ fn persist_evidence(f: &Fixture, dir: &Path) -> Check {
         "cannot create NEW evidence; never reuse run",
     )?;
     let record = serde_json::json!({"format": 1, "fixture": f, "prefix": f.prefix(),
-        "keys": [format!("{}a/empty", f.prefix()), format!("{}a/small", f.prefix()), format!("{}a/multipart", f.prefix())],
+        "keys": PLANNED_LABELS.map(|label| format!("{}a/{label}", f.prefix())),
         "warning": "Any request may have unknown outcome; enumerate exact prefix versions, markers and MPUs. Local exit is not remote settlement. No credentials recorded."});
     let bytes = checked(serde_json::to_vec_pretty(&record), "cannot encode evidence")?;
     require(bytes.len() <= 16 * 1024, "evidence size exceeded")?;
@@ -1088,6 +1099,357 @@ async fn upload_case(
         "terminal deletion observation",
     )
 }
+// Two bounded orphan cases in the SAME enrolled namespace and owned scenario.
+// No scanner progress, notification simulation or real-cloud fault injection.
+async fn retire_observed_orphan(
+    journal: &CommandJournal,
+    qualified: &QualifiedNamespace,
+    observation: ObservedOrphanObject,
+    policy: &OrphanGracePolicy,
+    clock: &impl Fn() -> Result<ClockObservation, ClockError>,
+) -> Check {
+    let version = observation.version().clone();
+    // A second actual HEAD, saved before registration AND physical deletion.
+    // Reusing it later must preserve existing accounting rather than overwrite it.
+    let repeated = checked(
+        observe_orphan_object(journal, qualified, &version).await,
+        "second pre-delete orphan observation",
+    )?;
+    let context = checked(journal.command_context().await, "orphan retirement context")?;
+    let creation = ResourceId::from_command(context.id());
+    let prepared = checked(
+        journal
+            .prepare_orphan_retirement(context, observation, policy, clock, result())
+            .await,
+        "prepare orphan retirement",
+    )?;
+    let OrphanPreparation::Prepared(command) = prepared else {
+        return Err("new orphan unexpectedly tracked");
+    };
+    commit(journal, &command).await?;
+    let retiring = checked(journal.read_version(&version).await, "read orphan RETIRING")?
+        .ok_or("orphan retirement missing")?;
+    require(
+        retiring.state() == VersionState::Retiring
+            && retiring.references() == 0
+            && retiring.claims() == 0
+            && retiring.creation_id() == &creation
+            && retiring.namespace_id() == qualified.configuration().id()
+            && retiring.configuration_revision() == repeated.namespace().configuration_revision(),
+        "orphan must be created RETIRING with zero counts, never READY",
+    )?;
+    let repeated = checked(
+        journal
+            .prepare_orphan_retirement(
+                checked(journal.command_context().await, "repeat orphan context")?,
+                repeated,
+                policy,
+                clock,
+                result(),
+            )
+            .await,
+        "repeat orphan retirement preparation",
+    )?;
+    let OrphanPreparation::ExistingTracked(existing) = repeated else {
+        return Err("repeat orphan attempted accounting overwrite");
+    };
+    require(
+        existing == retiring,
+        "repeat changed orphan creation/accounting",
+    )?;
+    require(
+        checked(
+            journal.read_version(&version).await,
+            "reread orphan accounting",
+        )? == Some(retiring),
+        "repeat overwrote orphan metadata",
+    )?;
+    require(
+        checked(
+            delete_retiring_version(journal, qualified, &version).await,
+            "delete exact orphan version",
+        )? == DeletionOutcome::Deleted,
+        "orphan deletion unconfirmed",
+    )?;
+    let deleted = checked(journal.read_version(&version).await, "read orphan DELETED")?
+        .ok_or("deleted orphan metadata missing")?;
+    require(
+        deleted.state() == VersionState::Deleted
+            && deleted.references() == 0
+            && deleted.claims() == 0
+            && deleted.creation_id() == &creation,
+        "orphan DELETED accounting/identity mismatch",
+    )
+}
+
+async fn orphan_cases(
+    f: &Fixture,
+    s3: &S3,
+    journal: &CommandJournal,
+    ns: &NamespaceSnapshot,
+    qualified: &QualifiedNamespace,
+) -> Check {
+    // The three normal versions have already been retired and deleted. This
+    // empty pass is only an observation, never a permanent absence/drain proof.
+    let initial = checked(
+        list_version_page(qualified, None, 100).await,
+        "initial orphan inventory",
+    )?;
+    require(
+        initial.versions().is_empty()
+            && initial.delete_markers().is_empty()
+            && initial.next_cursor().is_none(),
+        "initial namespace inventory not empty",
+    )?;
+    let claims = checked(
+        ClaimPolicy::new(600_000, 30_000, 1000),
+        "orphan claim policy",
+    )?;
+    let grace = checked(
+        OrphanGracePolicy::new(1000, 1000),
+        "explicit orphan grace policy",
+    )?;
+    let payload = b"unselected synthetic object";
+    let hash: [u8; 32] = Sha256::digest(payload).into();
+    let context = checked(journal.command_context().await, "orphan intent context")?;
+    let intent_id = ResourceId::from_command(context.id());
+    let (clock, deadline) = timing()?;
+    let command = checked(
+        journal.prepare_begin_intent(
+            context,
+            ns,
+            format!("{}{KNOWN_ORPHAN}", ns.key_prefix()),
+            checked(
+                UploadConstraints::new(63, Some(payload.len() as u64), Some(hash)),
+                "orphan constraints",
+            )?,
+            deadline,
+            clock,
+            &claims,
+            result(),
+        ),
+        "prepare orphan intent",
+    )?;
+    commit(journal, &command).await?;
+    let intent = checked(journal.read_intent(&intent_id).await, "read orphan intent")?
+        .ok_or("orphan intent missing")?;
+    let context = checked(journal.command_context().await, "orphan attempt context")?;
+    let attempt_id = ResourceId::from_command(context.id());
+    require(attempt_id != intent_id, "orphan resource identities reused")?;
+    let (clock, deadline) = timing()?;
+    let mpu_until = checked(
+        clock.lower_bound().and_then(|n| n.checked_add(7_200_000)),
+        "orphan MPU bound",
+    )?;
+    let command = checked(
+        journal.prepare_begin_attempt(
+            context,
+            &intent,
+            ns,
+            deadline,
+            mpu_until,
+            clock,
+            &claims,
+            result(),
+        ),
+        "prepare orphan attempt",
+    )?;
+    commit(journal, &command).await?;
+    // Fresh SystemTime on the normal native transfer path; deliberately no
+    // verify/select/publication, so no Version row or staging claim is created.
+    let candidate = checked(
+        transfer_upload(
+            journal,
+            qualified,
+            &attempt_id,
+            std::io::Cursor::new(payload),
+            &claims,
+            &sample_clock,
+        )
+        .await,
+        "unselected native transfer failed/unknown",
+    )?;
+    let version = candidate.version();
+    require(
+        candidate.length() == payload.len() as u64 && candidate.full_sha256() == &hash,
+        "unselected transfer constraints mismatch",
+    )?;
+    let later = checked(
+        list_version_page(qualified, None, 100).await,
+        "later orphan inventory",
+    )?;
+    require(
+        later.versions() == std::slice::from_ref(version)
+            && later.delete_markers().is_empty()
+            && later.next_cursor().is_none(),
+        "later pass did not find exact late candidate",
+    )?;
+    let observation = checked(
+        observe_orphan_object(journal, qualified, version).await,
+        "observe known orphan",
+    )?;
+    require(
+        matches!(observation.attribution(), OrphanAttribution::Known(known)
+        if known.intent_id() == &intent_id && known.attempt_id() == &attempt_id),
+        "native attribution differs from persisted admission",
+    )?;
+    let intent = checked(
+        journal.read_intent(&intent_id).await,
+        "read OPEN orphan intent",
+    )?
+    .ok_or("OPEN orphan intent missing")?;
+    let attempt = checked(
+        journal.read_attempt(&attempt_id).await,
+        "read ACTIVE orphan attempt",
+    )?
+    .ok_or("ACTIVE orphan attempt missing")?;
+    require(
+        intent.state() == IntentState::Open && attempt.state() == AttemptState::Active,
+        "orphan must remain OPEN/ACTIVE before cancellation",
+    )?;
+    require(
+        matches!(
+            journal
+                .prepare_orphan_retirement(
+                    checked(
+                        journal.command_context().await,
+                        "selection-possible context"
+                    )?,
+                    observation,
+                    &grace,
+                    &sample_clock,
+                    result(),
+                )
+                .await,
+            Err(OrphanError::SelectionPossible)
+        ),
+        "OPEN/ACTIVE orphan must reject as SelectionPossible",
+    )?;
+    require(
+        checked(
+            journal.read_version(version).await,
+            "read unregistered orphan",
+        )?
+        .is_none(),
+        "rejected orphan retirement created a Version row",
+    )?;
+    let cancel = checked(
+        journal.prepare_cancel_intent(
+            checked(
+                journal.command_context().await,
+                "cancel orphan intent context",
+            )?,
+            &intent,
+            result(),
+        ),
+        "prepare native orphan intent cancellation",
+    )?;
+    commit(journal, &cancel).await?;
+    require(
+        checked(
+            journal.read_intent(&intent_id).await,
+            "read cancelled orphan intent",
+        )?
+        .is_some_and(|i| i.state() == IntentState::Cancelled),
+        "orphan intent not CANCELLED",
+    )?;
+    let observation = checked(
+        observe_orphan_object(journal, qualified, version).await,
+        "reobserve cancelled exact orphan",
+    )?;
+    retire_observed_orphan(journal, qualified, observation, &grace, &sample_clock).await?;
+
+    // Explicit SYNTHETIC TEST SETUP ONLY, not an adoption helper: one raw Put,
+    // no reserved attribution metadata, at a key already in fsync'd evidence.
+    let raw_key = format!("{}{UNATTRIBUTED_ORPHAN}", ns.key_prefix());
+    require(
+        f.owns_key(&raw_key) && raw_key == format!("{}a/{UNATTRIBUTED_ORPHAN}", f.prefix()),
+        "unattributed setup escaped declared owned key",
+    )?;
+    let raw = checked(
+        s3.put_object()
+            .bucket(&f.bucket)
+            .expected_bucket_owner(&f.account)
+            .key(&raw_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"synthetic unattributed",
+            ))
+            .send()
+            .await,
+        "synthetic unattributed Put failed/unknown",
+    )?;
+    let raw_version = checked(
+        VersionRef::new(
+            ns.store().clone(),
+            raw_key,
+            raw.version_id().ok_or("synthetic Put VersionId missing")?,
+        ),
+        "synthetic Put invalid/null VersionId",
+    )?;
+    let observation = checked(
+        observe_orphan_object(journal, qualified, &raw_version).await,
+        "observe unattributed synthetic version",
+    )?;
+    require(
+        matches!(
+            observation.attribution(),
+            OrphanAttribution::Unattributed(_)
+        ),
+        "synthetic object unexpectedly attributed",
+    )?;
+    let modified = observation.last_modified();
+    // Controlled trusted TEST clock boundary, not real elapsed grace or production
+    // clock calibration. The normal transfer clock above remains fresh SystemTime.
+    let at_modified = || ClockObservation::trusted(modified, 1000);
+    require(
+        matches!(
+            journal
+                .prepare_orphan_retirement(
+                    checked(journal.command_context().await, "grace-pending context")?,
+                    observation,
+                    &grace,
+                    &at_modified,
+                    result(),
+                )
+                .await,
+            Err(OrphanError::GracePending)
+        ),
+        "unattributed grace must remain pending",
+    )?;
+    require(
+        checked(
+            journal.read_version(&raw_version).await,
+            "read grace-pending version",
+        )?
+        .is_none(),
+        "grace-pending created a Version row",
+    )?;
+    let eligible = checked(
+        modified
+            .checked_add(grace.grace_ms())
+            .and_then(|n| n.checked_add(1000)),
+        "virtual grace boundary overflow",
+    )?;
+    let at_boundary = || ClockObservation::trusted(eligible, 1000);
+    let observation = checked(
+        observe_orphan_object(journal, qualified, &raw_version).await,
+        "reobserve unattributed synthetic version",
+    )?;
+    retire_observed_orphan(journal, qualified, observation, &grace, &at_boundary).await?;
+    let final_page = checked(
+        list_version_page(qualified, None, 100).await,
+        "final orphan inventory",
+    )?;
+    require(
+        final_page.versions().is_empty()
+            && final_page.delete_markers().is_empty()
+            && final_page.next_cursor().is_none(),
+        "orphan exact physical deletion incomplete",
+    )
+    // Parent cleanup still enumerates ALL owned versions/markers AND MPUs, even
+    // on a scenario failure; no request-settlement inference from this empty page.
+}
+
 async fn scenario(f: Fixture, db: Dynamo, s3: S3) -> Check {
     let tables = checked(
         EnrolledTables::enroll(
@@ -1134,7 +1496,7 @@ async fn scenario(f: Fixture, db: Dynamo, s3: S3) -> Check {
         ))
         .await?;
     }
-    Ok(())
+    Box::pin(orphan_cases(&f, &s3, &journal, &ns, &qualified)).await
 }
 
 /// Read-only diagnostic for a failed profile gate; never initializes metadata or
@@ -1289,6 +1651,20 @@ fn exact_prefix_and_namespace_ownership() {
     assert!(f.configuration("../unmanaged").is_err());
 }
 #[test]
+fn planned_orphan_keys_are_distinct_and_owned_before_writes() {
+    let f = fixture();
+    let keys = PLANNED_LABELS.map(|label| format!("{}a/{label}", f.prefix()));
+    assert_eq!(keys.iter().collect::<BTreeSet<_>>().len(), 5);
+    assert!(keys.iter().all(|key| f.owns_key(key)));
+    for label in [KNOWN_ORPHAN, UNATTRIBUTED_ORPHAN] {
+        assert!(keys.contains(&format!(
+            "{}{label}",
+            f.configuration("a").unwrap().key_prefix()
+        )));
+    }
+}
+
+#[test]
 fn partial_pagination_is_never_complete() {
     assert!(
         Pages::default()
@@ -1404,6 +1780,9 @@ fn loopback(
                 }
                 Err(_) => panic!("loopback accept failed"),
             };
+            // Accepted sockets can inherit nonblocking mode on macOS. The
+            // header reader below is deliberately blocking with a finite timeout.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -1412,6 +1791,7 @@ fn loopback(
                 .unwrap();
             let mut bytes = Vec::new();
             while !bytes.ends_with(b"\r\n\r\n") {
+                assert!(Instant::now() < deadline, "loopback header budget expired");
                 assert!(bytes.len() < 16 * 1024, "loopback header bound");
                 let mut byte = [0];
                 socket.read_exact(&mut byte).unwrap();

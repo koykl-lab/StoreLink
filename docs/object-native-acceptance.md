@@ -112,6 +112,45 @@ native reads verify the application item, reference, READY counts (0 refs/1 clai
 before publication; 1 ref/0 claims afterward), and RELEASED/CONSUMED stage/intent.
 An explicit VersionId GET checks published bytes and SHA-256; there is no latest-key
 fallback. This final diagnostic read does **not** claim use-pin acceptance.
+The application pointer and reference are then atomically removed; tracked
+retirement must reject the earlier referenced READY version, then permit the
+unprotected version to become RETIRING (0 references/0 claims). Exact-version
+`delete_retiring_version` must produce DELETED; repetition observes AlreadyDeleted.
+
+After all three normal objects are retired, the same namespace `a/` exercises two
+additional bounded cases, with no new harness or resources:
+
+- **Known, unselected version (`a/orphan-unselected`):** `list_version_page`
+  first observes an empty namespace. Persist a fresh intent and attempt, transfer
+  a payload under 64 bytes through the normal native adapter, but never select or
+  publish it. A later page must find exactly that candidate: the earlier empty
+  pass is not permanent absence. Native exact-version observation must recover
+  the admitting identities. While the intent/attempt remain OPEN/ACTIVE,
+  `prepare_orphan_retirement` must specifically return SelectionPossible and leave
+  no Version row. Cancel the intent with the native journal command, reobserve
+  the exact candidate, then prepare/execute guarded orphan retirement directly
+  into RETIRING with zero counts, never READY.
+- **Unattributed fixture (`a/orphan-unattributed`):** one explicit synthetic raw
+  native Put, under the predeclared owned key and expected bucket owner, supplies
+  no reserved metadata. Its returned VersionId must be non-null and the exact
+  observer must classify it as Unattributed. An explicit positive 1000-ms grace
+  policy with 1000-ms uncertainty is tested using a **controlled trusted virtual
+  test clock**: at LastModified, preparation returns GracePending with no Version
+  row; at LastModified + grace + uncertainty, its conservative lower bound reaches
+  eligibility and guarded registration creates RETIRING/0/0. This is a virtual
+  clock boundary test, **not real elapsed grace or production clock calibration**.
+  Raw Put is synthetic test setup only, not a production adoption helper.
+
+For each case a second actual HEAD observation is captured before registration
+and deletion. Repeating preparation with that observation must return
+ExistingTracked with the same complete snapshot/creation identity, without
+writing over accounting. The existing exact-version deletion adapter must then
+produce DELETED/0/0 with the original creation identity. A final native page must
+be empty; parent cleanup still checks the entire owned prefix's versions, delete
+markers and MPUs. Unknown/future-schema and foreign attribution stay in unit and
+loopback coverage; no deliberately abandoned real MPU is added. These cases do
+not implement a recurring scanner, fabricate GC progress, or prove full GC
+convergence, late in-flight request settlement or metadata compaction.
 
 Payloads are synthetic: zero bytes, 37 bytes and **8 MiB + 17 bytes**. The current
 transfer adapter uses a single Put for the first two and two 8-MiB-bounded parts for
@@ -142,7 +181,9 @@ listings (at most 1000 configurations) and the enclosing scenario deadline.
 ## Cleanup, unknown outcomes and evidence
 
 Before **any writes**, create-new, fsync'd private `object-<RUN_UUID>.json` evidence
-records the exact fixture, UUID prefix and planned keys. A reused evidence name
+records the exact fixture, UUID prefix and all five planned keys (`a/empty`,
+`a/small`, `a/multipart`, `a/orphan-unselected`, `a/orphan-unattributed`), including
+both synthetic orphan keys **before their S3 writes**. A reused evidence name
 fails before mutation. It intentionally records no credentials, profile, payload,
 attribution metadata or response body. This prefix allowlist supports unknown
 Put/Create/Complete outcomes where no candidate version was returned. Evidence is
@@ -171,8 +212,9 @@ inventory (55-second inner budget plus scheduling slack). Failure labels accumul
 and fail the result even if the final listings are empty. Pre-write ownership
 failure still stops deletion. It never deletes tables/buckets, touches other
 prefixes or issues AbortMultipartUpload. This is explicit removal of
-synthetic fixture versions, **not StoreLink garbage-collection acceptance**; live
-synthetic application/reference records remain until the parent destroys tables.
+synthetic fixture versions, **not StoreLink garbage-collection acceptance**.
+The successful normal cases unlink their application/reference records; failure
+may leave them live. All remaining table rows belong to parent fixture teardown.
 
 If either MPU listing contains unfinished uploads, cleanup is incomplete: retain
 the fixture for the continuously maintained provider lifecycle. No busy wait,
@@ -192,7 +234,8 @@ CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
 ```
 
 Ordinary tests in this target check identity/ARN/run tags, namespace/prefix
-ownership, ACTIVE pk/sk schemas and incomplete-pagination classification. Two
+ownership, the distinct predeclared synthetic keys, ACTIVE pk/sk schemas and
+incomplete-pagination classification. Two
 additional regressions construct synthetic-credential, explicit-loopback SDK
 clients: the pinned SDK deserializes terminal MPU XML with empty and populated
 markers, and cleanup continues after a failed delete through both final
@@ -202,6 +245,13 @@ Compilation does not run these ordinary tests. To run only offline tests:
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
   cargo test --all-features --test object_aws -- --skip native_object_contract_aws
+```
+
+Strict Clippy for this target (also no ignored execution or AWS calls):
+
+```sh
+CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/storelink-object-target \
+  cargo clippy --all-features --test object_aws -- -D warnings
 ```
 
 Only after separate review, provisioning and explicit authorization, an operator

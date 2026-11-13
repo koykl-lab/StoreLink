@@ -178,7 +178,7 @@ impl Candidate<'_> {
     }
 }
 
-fn compacted(fence: &DomainFence, scope: &Scope) -> Result<(), PruningError> {
+pub(super) fn compacted(fence: &DomainFence, scope: &Scope) -> Result<(), PruningError> {
     if scope.domain() != fence.domain() {
         return Err(PruningError::WrongDomain);
     }
@@ -305,7 +305,11 @@ impl CommandJournal {
 // arbitrary field guessing). Codecs reject unknown fields before constructing a
 // write. As with existing guards, future authority schemas must fence old writers,
 // not append hidden authority behind unchanged identity/revision/discriminators.
-fn full_guard(table: &str, item: &Item, fields: &[&str]) -> Result<ConditionCheck, PruningError> {
+pub(super) fn full_guard(
+    table: &str,
+    item: &Item,
+    fields: &[&str],
+) -> Result<ConditionCheck, PruningError> {
     let mut check = guard(table, item.clone())?
         .condition_check
         .ok_or(PruningError::Corrupt)?;
@@ -354,7 +358,7 @@ fn deletion_actions(
         TransactWriteItem::builder().delete(delete).build(),
     ])
 }
-fn write_error(error: Option<&TransactWriteItemsError>) -> PruningError {
+pub(super) fn write_error(error: Option<&TransactWriteItemsError>) -> PruningError {
     if let Some(TransactWriteItemsError::TransactionCanceledException(e)) = error
         && e.cancellation_reasons()
             .iter()

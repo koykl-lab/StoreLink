@@ -212,6 +212,10 @@ impl CommandJournal {
         &self.client
     }
 
+    pub(super) fn enrolled_tables(&self) -> &EnrolledTables {
+        &self.tables
+    }
+
     pub(super) fn coordination_arn(&self) -> &str {
         self.tables.coordination_table_arn()
     }
@@ -598,7 +602,10 @@ impl CommandJournal {
     }
 }
 
-fn native_message<E: ProvideErrorMetadata>(error: Option<&E>, fallback: String) -> String {
+pub(super) fn native_message<E: ProvideErrorMetadata>(
+    error: Option<&E>,
+    fallback: String,
+) -> String {
     error
         .map(|e| {
             format!(
