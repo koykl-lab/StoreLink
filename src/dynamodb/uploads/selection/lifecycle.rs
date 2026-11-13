@@ -127,6 +127,7 @@ pub(in crate::dynamodb) fn selected_binding(
         || staged.configuration_revision != intent.configuration_revision()
         || staged.version().store() != intent.target().store()
         || staged.version().key() != intent.target().key()
+        || staged.constraints != *intent.constraints()
     {
         return Err(UploadError::Binding);
     }
@@ -324,6 +325,9 @@ mod tests {
                 attempt: id(&domain, 2, 4),
                 namespace: ns.id.clone(),
                 configuration_revision: ns.configuration_revision,
+                constraints: intent.constraints().clone(),
+                verified_length: 10,
+                verified_full_sha256: None,
                 claim: Claim::new(
                     id(&domain, 3, 5),
                     VersionRef::new(ns.store.clone(), "fresh/object", "version").unwrap(),
@@ -452,6 +456,33 @@ mod tests {
             );
         } else {
             assert!(action.condition_check.is_some());
+        }
+    }
+
+    #[test]
+    fn unknown_expected_length_facts_survive_every_staged_transition() {
+        for hash in [None, Some([7; 32])] {
+            let mut f = Fixture::new();
+            f.staged.verified_full_sha256 = hash;
+            let old = encode_staged(&f.staged).unwrap();
+            for action in [
+                f.renew(clock(2000)).unwrap().remove(2),
+                f.cancel().unwrap().remove(1),
+                f.revoke(clock(2505)).unwrap().remove(2),
+            ] {
+                assert_old_put(&action, &old);
+                let next = staged_from(&action, f.intent.id());
+                assert_eq!(next.verified_length(), 10);
+                assert_eq!(next.verified_full_sha256(), hash.as_ref());
+                assert_eq!(next.constraints.expected_length(), None);
+                let put = action.put.unwrap();
+                assert!(
+                    put.expression_attribute_names()
+                        .unwrap()
+                        .values()
+                        .any(|name| name == "verified_full_sha256")
+                );
+            }
         }
     }
 
@@ -800,6 +831,7 @@ mod tests {
             "key",
             "attempt",
             "claim",
+            "constraints",
         ] {
             let mut f = Fixture::new();
             match field {
@@ -817,6 +849,10 @@ mod tests {
                 "config" => f.staged.configuration_revision = Uuid::from_u128(99),
                 "store" => f.intent.admission.target.store = StoreId::new("other").unwrap(),
                 "key" => f.intent.admission.target.key = "fresh/other".into(),
+                "constraints" => {
+                    f.intent.admission.constraints =
+                        UploadConstraints::new(101, None, None).unwrap()
+                }
                 "attempt" => f.staged.attempt = id(&DomainId::new("other").unwrap(), 2, 4),
                 "claim" => {
                     f.staged.claim = Claim::new(
@@ -875,6 +911,9 @@ mod tests {
                 .unwrap();
         f.intent.admission.deadline = TimestampMs::MAX;
         f.staged.intent = f.intent.id().clone();
+        f.staged.constraints = f.intent.constraints().clone();
+        f.staged.verified_length = i64::MAX as u64;
+        f.staged.verified_full_sha256 = Some([255; 32]);
         f.staged.attempt = id(&f.ns.domain, u64::MAX, 4);
         f.staged.namespace = f.ns.id.clone();
         f.staged.claim = Claim::new(

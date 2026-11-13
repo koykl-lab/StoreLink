@@ -147,7 +147,7 @@ impl Seed {
         strings(
             &mut stage_row,
             &[
-                ("record", "staged".into()),
+                ("record", "staged-verified-v1".into()),
                 ("kind", "STAGED".into()),
                 ("domain", domain.as_str().into()),
                 ("incarnation", incarnation.to_string()),
@@ -170,8 +170,13 @@ impl Seed {
                 ("attempt_generation", attempt_id.scope().generation()),
                 ("claim_generation", claim_id.scope().generation()),
                 ("deadline", 1800),
+                ("max_length", 100),
+                ("expected_length", 10),
+                ("verified_length", 10),
             ],
         );
+        stage_row.insert("full_sha256".into(), A::B(Blob::new([7; 32])));
+        stage_row.insert("verified_full_sha256".into(), A::B(Blob::new([7; 32])));
         f.put(&f.coord, stage_row).await;
         // Same flat version schema as selection::encode_version and the shared
         // references count engine: exactly zero edges and ONE staging claim.

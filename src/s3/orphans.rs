@@ -55,16 +55,52 @@ impl VersionPageCursor {
     pub fn version_id_marker(&self) -> &str {
         &self.version
     }
+
+    /// Restore scheduling data only after the caller has coherently checked the
+    /// enrolled namespace/configuration revision. Never public cursor forging.
+    #[cfg(feature = "dynamodb")]
+    pub(crate) fn restore(
+        qualified: &QualifiedNamespace,
+        key: &str,
+        version: &str,
+    ) -> Result<Self, OrphanObservationError> {
+        let c = qualified.configuration();
+        VersionRef::new(c.store().clone(), key, version)
+            .map_err(|_| OrphanObservationError::Listing)?;
+        if !key.starts_with(c.key_prefix()) {
+            return Err(OrphanObservationError::Binding);
+        }
+        Ok(Self {
+            configuration: c.clone(),
+            key: key.into(),
+            version: version.into(),
+        })
+    }
 }
 
 /// Inventory only, not evidence that anything is abandoned. Delete markers are
 /// separate from content candidates. Even an empty final page is not a drain.
-#[derive(Debug)]
 pub struct VersionPage {
+    // Bind even an empty terminal page to the actual native request, not merely
+    // to its returned versions or optional continuation.
+    #[cfg_attr(not(feature = "dynamodb"), allow(dead_code))]
+    configuration: NamespaceConfiguration,
+    #[cfg_attr(not(feature = "dynamodb"), allow(dead_code))]
+    input_markers: Option<(String, String)>,
     versions: Vec<VersionRef>,
     delete_markers: Vec<VersionRef>,
     next: Option<VersionPageCursor>,
 }
+impl std::fmt::Debug for VersionPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionPage")
+            .field("version_count", &self.versions.len())
+            .field("delete_marker_count", &self.delete_markers.len())
+            .field("has_continuation", &self.next.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl VersionPage {
     pub fn versions(&self) -> &[VersionRef] {
         &self.versions
@@ -74,6 +110,16 @@ impl VersionPage {
     }
     pub fn next_cursor(&self) -> Option<&VersionPageCursor> {
         self.next.as_ref()
+    }
+    #[cfg(feature = "dynamodb")]
+    pub(crate) fn matches_configuration(&self, c: &NamespaceConfiguration) -> bool {
+        same_configuration(&self.configuration, c)
+    }
+    #[cfg(feature = "dynamodb")]
+    pub(crate) fn input_markers(&self) -> Option<(&str, &str)> {
+        self.input_markers
+            .as_ref()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
     }
 }
 
@@ -255,6 +301,8 @@ fn check_page(
         None => return Err(bad()),
     };
     Ok(VersionPage {
+        configuration: c.clone(),
+        input_markers: cursor.map(|p| (p.key.clone(), p.version.clone())),
         versions,
         delete_markers,
         next,

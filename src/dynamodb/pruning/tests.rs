@@ -115,7 +115,7 @@ fn stage_row(state: &str) -> Item {
     text_fields(
         &mut row,
         &[
-            ("record", "staged".into()),
+            ("record", "staged-verified-v1".into()),
             ("kind", "STAGED".into()),
             ("domain", domain().as_str().into()),
             ("incarnation", incarnation().to_string()),
@@ -133,6 +133,8 @@ fn stage_row(state: &str) -> Item {
         ("attempt_generation", 2),
         ("claim_generation", 3),
         ("deadline", 100),
+        ("max_length", 100),
+        ("verified_length", 10),
     ] {
         row.insert(key.into(), n(value));
     }

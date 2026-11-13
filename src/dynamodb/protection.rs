@@ -1159,7 +1159,7 @@ mod tests {
             let mut staged_row = resource_key("STAGED", intent.id());
             insert_tuple(&mut staged_row, v.version());
             staged_row.extend([
-                ("record".into(), s("staged")),
+                ("record".into(), s("staged-verified-v1")),
                 ("kind".into(), s("STAGED")),
                 ("domain".into(), s("domain")),
                 ("incarnation".into(), s(Uuid::from_u128(1).to_string())),
@@ -1177,6 +1177,8 @@ mod tests {
                 ("attempt_generation".into(), n(2)),
                 ("claim_generation".into(), n(3)),
                 ("deadline".into(), n(2500)),
+                ("max_length".into(), n(100)),
+                ("verified_length".into(), n(10)),
             ]);
             native.item(&staged_row);
             let staged = journal.read_staged(intent.id()).await.unwrap().unwrap();

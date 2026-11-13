@@ -216,7 +216,9 @@ Restrict the run's principal to the two expected table ARNs in the expected regi
 and account, with creation request tags constrained to the values above. The
 harness uses CreateTable (including permission to attach its creation tags),
 DescribeTable, ListTagsOfResource, DeleteTable, GetItem, PutItem, DeleteItem,
-TransactGetItems and TransactWriteItems. Native STS GetCallerIdentity is also used.
+TransactGetItems and TransactWriteItems. Discovery additionally requires
+`dynamodb:Scan`, scoped only to the owned coordination-table ARN (not all tables
+or the application table). Native STS GetCallerIdentity is also used.
 There is no S3 access, ListTables, broad deletion or existing-resource adoption.
 Do not grant broad production access simply to make this test pass.
 

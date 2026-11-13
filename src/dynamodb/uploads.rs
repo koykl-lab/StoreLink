@@ -1226,7 +1226,11 @@ fn expression_guard(item: &Item) -> Condition {
 }
 fn condition(item: &Item) -> Condition {
     let mut c = expression_guard(item);
-    for field in ["expected_length", "full_sha256"] {
+    let staged = item.get("record") == Some(&s("staged-verified-v1"));
+    for field in ["expected_length", "full_sha256", "verified_full_sha256"] {
+        if field == "verified_full_sha256" && !staged {
+            continue;
+        }
         if !item.contains_key(field) {
             let alias = format!("#missing_{field}");
             c.expression
@@ -1235,6 +1239,61 @@ fn condition(item: &Item) -> Condition {
         }
     }
     c
+}
+
+// Shared canonical store-binding schema for enrollment and read-only discovery.
+// Physical field bounds match the persisted namespace codec; provider
+// qualification remains the enrollment prerequisite, not a discovery operation.
+fn encode_store_binding(
+    domain: &DomainId,
+    store: &StoreId,
+    bucket: &str,
+    expected_owner: &str,
+    region: &str,
+) -> Result<Item, UploadError> {
+    let hex: String = store
+        .as_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut item = key(format!("{}#STORE#{hex}", prefix(domain)));
+    for (name, value) in [
+        ("record", "store-binding-v1"),
+        ("domain", domain.as_str()),
+        ("store", store.as_str()),
+        ("bucket", bucket),
+        ("expected_owner", expected_owner),
+        ("region", region),
+        ("provider_profile", PROFILE),
+    ] {
+        item.insert(name.into(), s(value));
+    }
+    check_size(&item)?;
+    bounded(bucket, "bucket", 63)?;
+    bounded(region, "region", 64)?;
+    if expected_owner.len() != 12 || !expected_owner.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(UploadError::Corrupt);
+    }
+    Ok(item)
+}
+
+pub(super) fn decode_store_binding(domain: &DomainId, item: &Item) -> Result<(), UploadError> {
+    let stored_domain = DomainId::new(text(item, "domain")?)?;
+    let store = StoreId::new(text(item, "store")?)?;
+    if &stored_domain != domain {
+        return Err(UploadError::Binding);
+    }
+    exact(
+        item,
+        encode_store_binding(
+            &stored_domain,
+            &store,
+            text(item, "bucket")?,
+            text(item, "expected_owner")?,
+            text(item, "region")?,
+        )?,
+    )
 }
 
 /// A library-only, closed canonical schema: the condition checks every named
@@ -1249,26 +1308,13 @@ fn store_binding_action(
     ns: &NamespaceSnapshot,
 ) -> Result<TransactWriteItem, UploadError> {
     // Production callers derive this snapshot only from QualifiedFreshNamespace.
-    let hex: String = ns
-        .store
-        .as_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let mut item = key(format!("{}#STORE#{hex}", prefix(&ns.domain)));
-    for (name, value) in [
-        ("record", "store-binding-v1"),
-        ("domain", ns.domain.as_str()),
-        ("store", ns.store.as_str()),
-        ("bucket", ns.bucket.as_str()),
-        ("expected_owner", ns.expected_owner.as_str()),
-        ("region", ns.region.as_str()),
-        ("provider_profile", ns.provider_profile()),
-    ] {
-        item.insert(name.into(), s(value));
-    }
-    check_size(&item)?;
+    let item = encode_store_binding(
+        &ns.domain,
+        &ns.store,
+        &ns.bucket,
+        &ns.expected_owner,
+        &ns.region,
+    )?;
     let mut c = expression_guard(&item);
     c.names.insert("#pk".into(), "pk".into());
     let put = Put::builder()
@@ -1427,6 +1473,7 @@ mod store_binding_tests {
             ])
         );
         assert_full_predicate(&put);
+        decode_store_binding(&ns.domain, put.item()).unwrap();
     }
 
     #[test]

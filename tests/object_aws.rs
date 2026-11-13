@@ -26,16 +26,16 @@ use storelink::{
     clock::{ClockError, ClockObservation, TimestampMs},
     dynamodb::{
         ApplicationActions, AttemptState, CommandJournal, EnrolledTables, IntentState,
-        NamespaceSnapshot, OrphanError, OrphanGracePolicy, OrphanPreparation, Outcome,
-        PreparedCommand, ReclamationError, ReferenceChange, ReferenceId, UploadConstraints,
-        VersionState,
+        InventoryProgressError, NamespaceSnapshot, OrphanError, OrphanGracePolicy,
+        OrphanPreparation, Outcome, PreparedCommand, ReclamationError, ReferenceChange,
+        ReferenceId, UploadConstraints, VersionState,
     },
     identity::{DomainId, NamespaceId, ResourceId, StoreId, VersionRef},
     s3::{
         DeletionError, DeletionOutcome, NamespaceConfiguration, NamespaceConfigurationSpec,
-        ObservedOrphanObject, OrphanAttribution, QualifiedNamespace, delete_retiring_version,
-        list_version_page, observe_orphan_object, qualify_existing, qualify_fresh, transfer_upload,
-        verify_candidate,
+        ObservedOrphanObject, OrphanAttribution, QualifiedNamespace, VersionPage,
+        delete_retiring_version, list_version_page, observe_orphan_object, qualify_existing,
+        qualify_fresh, transfer_upload, verify_candidate,
     },
 };
 use tokio::io::AsyncReadExt;
@@ -55,12 +55,15 @@ const SCENARIO: Duration = Duration::from_secs(600);
 const CLEANUP: Duration = Duration::from_secs(180);
 const KNOWN_ORPHAN: &str = "orphan-unselected";
 const UNATTRIBUTED_ORPHAN: &str = "orphan-unattributed";
-const PLANNED_LABELS: [&str; 5] = [
+const INVENTORY_LABELS: [&str; 2] = ["inventory-first", "inventory-second"];
+const PLANNED_LABELS: [&str; 7] = [
     "empty",
     "small",
     "multipart",
     KNOWN_ORPHAN,
     UNATTRIBUTED_ORPHAN,
+    INVENTORY_LABELS[0],
+    INVENTORY_LABELS[1],
 ];
 
 // Errors intentionally discard SDK bodies, native metadata, credentials and paths.
@@ -893,6 +896,8 @@ async fn upload_case(
     .ok_or("selected intent missing")?;
     require(
         stage.version() == &version
+            && stage.verified_length() == payload.len() as u64
+            && stage.verified_full_sha256() == Some(&hash)
             && stage.claim().state() == ClaimState::Active
             && intent.state() == IntentState::Selected,
         "selection state mismatch",
@@ -963,7 +968,10 @@ async fn upload_case(
     )?
     .ok_or("consumed intent missing")?;
     require(
-        stage.claim().state() == ClaimState::Released && intent.state() == IntentState::Consumed,
+        stage.claim().state() == ClaimState::Released
+            && intent.state() == IntentState::Consumed
+            && stage.verified_length() == payload.len() as u64
+            && stage.verified_full_sha256() == Some(&hash),
         "publication state mismatch",
     )?;
     let live_version = checked(
@@ -1450,6 +1458,175 @@ async fn orphan_cases(
     // on a scenario failure; no request-settlement inference from this empty page.
 }
 
+// Considering an inventory page means inspecting EVERY item before checkpointing.
+// Here the decision is deliberately retain-for-test, never GC eligibility/deletion.
+fn retained_inventory_candidate(page: &VersionPage, expected: &[VersionRef]) -> Check<VersionRef> {
+    require(
+        page.versions().len() == 1 && page.delete_markers().is_empty(),
+        "inventory fixture expected one version and no delete markers",
+    )?;
+    let candidate = &page.versions()[0];
+    require(
+        expected.contains(candidate),
+        "inventory returned unexpected exact version",
+    )?;
+    Ok(candidate.clone())
+}
+
+async fn inventory_progress_case(
+    f: &Fixture,
+    s3: &S3,
+    journal: &CommandJournal,
+    ns: &NamespaceSnapshot,
+    qualified: &QualifiedNamespace,
+) -> Check {
+    // Runs only AFTER the existing normal/orphan cases proved their final page empty.
+    // SYNTHETIC FIXTURE SETUP ONLY: both keys are already in fsync'd evidence.
+    // No attribution, publication, adoption, multipart upload or client abort.
+    let mut expected = Vec::with_capacity(2);
+    for (label, payload) in INVENTORY_LABELS.into_iter().zip([
+        b"retained inventory fixture one".as_slice(),
+        b"retained inventory fixture two".as_slice(),
+    ]) {
+        let raw_key = format!("{}{label}", ns.key_prefix());
+        require(
+            payload.len() < 64
+                && f.owns_key(&raw_key)
+                && raw_key == format!("{}a/{label}", f.prefix())
+                && PLANNED_LABELS.contains(&label),
+            "inventory setup escaped declared owned key/payload bound",
+        )?;
+        let raw = checked(
+            s3.put_object()
+                .bucket(&f.bucket)
+                .expected_bucket_owner(&f.account)
+                .key(&raw_key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(payload))
+                .send()
+                .await,
+            "synthetic inventory Put failed/unknown",
+        )?;
+        expected.push(checked(
+            VersionRef::new(
+                ns.store().clone(),
+                raw_key,
+                raw.version_id().ok_or("inventory Put VersionId missing")?,
+            ),
+            "inventory Put invalid/null VersionId",
+        )?);
+    }
+    let initial = checked(
+        journal.load_inventory_progress(qualified).await,
+        "load initial inventory progress",
+    )?;
+    require(
+        checked(initial.cursor(), "initial inventory cursor")?.is_none()
+            && initial.completed_passes() == 0
+            && initial.last_completion().is_none(),
+        "inventory progress must initially be empty",
+    )?;
+    let first = checked(
+        list_version_page(
+            qualified,
+            checked(initial.cursor(), "first input cursor")?,
+            1,
+        )
+        .await,
+        "first native inventory page",
+    )?;
+    // Record the ACTUAL candidate, not a key guessed from lexical order or markers.
+    let mut retained = vec![retained_inventory_candidate(&first, &expected)?];
+    let next = first
+        .next_cursor()
+        .ok_or("first inventory page must continue")?;
+    let saved_markers = (
+        next.key_marker().to_owned(),
+        next.version_id_marker().to_owned(),
+    );
+    // Capture both stale observation and its own native first page BEFORE the CAS.
+    let stale = checked(
+        journal.load_inventory_progress(qualified).await,
+        "load stale inventory observation",
+    )?;
+    require(
+        checked(stale.cursor(), "stale inventory cursor")?.is_none()
+            && stale.completed_passes() == 0
+            && stale.last_completion().is_none(),
+        "stale inventory observation not initial",
+    )?;
+    let stale_page = checked(
+        list_version_page(qualified, checked(stale.cursor(), "stale input cursor")?, 1).await,
+        "stale native first page",
+    )?;
+    let _stale_retained = retained_inventory_candidate(&stale_page, &expected)?;
+    require(
+        stale_page.next_cursor().is_some(),
+        "stale first page must continue",
+    )?;
+    // Bounded synthetic diagnostic time ONLY, not a trusted GC/retention clock.
+    let metric_time = checked(TimestampMs::new(1000), "inventory metric time")?;
+    checked(
+        journal
+            .checkpoint_considered_inventory_page(initial, first, Some(metric_time))
+            .await,
+        "checkpoint first considered inventory page",
+    )?;
+    require(
+        matches!(
+            journal
+                .checkpoint_considered_inventory_page(stale, stale_page, Some(metric_time))
+                .await,
+            Err(InventoryProgressError::Conflict)
+        ),
+        "stale inventory checkpoint must explicitly Conflict",
+    )?;
+    // Fresh native load restores the opaque cursor; no in-memory first-page cursor
+    // is supplied to the next S3 request. A stale CAS must not alter progress.
+    let restored = checked(
+        journal.load_inventory_progress(qualified).await,
+        "reload inventory progress after stale conflict",
+    )?;
+    let cursor = checked(restored.cursor(), "restored inventory cursor")?
+        .ok_or("durable inventory continuation missing")?;
+    require(
+        (cursor.key_marker(), cursor.version_id_marker())
+            == (saved_markers.0.as_str(), saved_markers.1.as_str())
+            && restored.completed_passes() == 0
+            && restored.last_completion().is_none(),
+        "stale checkpoint changed durable inventory progress",
+    )?;
+    let last = checked(
+        list_version_page(qualified, Some(cursor), 1).await,
+        "next native page using restored cursor",
+    )?;
+    retained.push(retained_inventory_candidate(&last, &expected)?);
+    require(
+        last.next_cursor().is_none()
+            && retained.len() == 2
+            && retained[0] != retained[1]
+            && expected.iter().all(|version| retained.contains(version)),
+        "inventory pass must consider exactly both retained versions and terminate",
+    )?;
+    checked(
+        journal
+            .checkpoint_considered_inventory_page(restored, last, Some(metric_time))
+            .await,
+        "checkpoint terminal considered inventory page",
+    )?;
+    let completed = checked(
+        journal.load_inventory_progress(qualified).await,
+        "reload durable completed inventory pass",
+    )?;
+    require(
+        checked(completed.cursor(), "completed inventory cursor")?.is_none()
+            && completed.completed_passes() == 1
+            && completed.last_completion() == Some(metric_time),
+        "terminal inventory progress must durably restart with one completed pass",
+    )
+    // Both versions remain retained test data. Existing parent cleanup removes
+    // their exact versions and checks the WHOLE prefix/MPUs, including on failure.
+}
+
 async fn scenario(f: Fixture, db: Dynamo, s3: S3) -> Check {
     let tables = checked(
         EnrolledTables::enroll(
@@ -1496,7 +1673,8 @@ async fn scenario(f: Fixture, db: Dynamo, s3: S3) -> Check {
         ))
         .await?;
     }
-    Box::pin(orphan_cases(&f, &s3, &journal, &ns, &qualified)).await
+    Box::pin(orphan_cases(&f, &s3, &journal, &ns, &qualified)).await?;
+    Box::pin(inventory_progress_case(&f, &s3, &journal, &ns, &qualified)).await
 }
 
 /// Read-only diagnostic for a failed profile gate; never initializes metadata or
@@ -1651,12 +1829,15 @@ fn exact_prefix_and_namespace_ownership() {
     assert!(f.configuration("../unmanaged").is_err());
 }
 #[test]
-fn planned_orphan_keys_are_distinct_and_owned_before_writes() {
+fn planned_orphan_and_inventory_keys_are_distinct_and_owned_before_writes() {
     let f = fixture();
     let keys = PLANNED_LABELS.map(|label| format!("{}a/{label}", f.prefix()));
-    assert_eq!(keys.iter().collect::<BTreeSet<_>>().len(), 5);
+    assert_eq!(keys.iter().collect::<BTreeSet<_>>().len(), 7);
     assert!(keys.iter().all(|key| f.owns_key(key)));
-    for label in [KNOWN_ORPHAN, UNATTRIBUTED_ORPHAN] {
+    for label in [KNOWN_ORPHAN, UNATTRIBUTED_ORPHAN]
+        .into_iter()
+        .chain(INVENTORY_LABELS)
+    {
         assert!(keys.contains(&format!(
             "{}{label}",
             f.configuration("a").unwrap().key_prefix()
